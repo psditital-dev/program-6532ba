@@ -47,7 +47,8 @@ const BPS: u64 = 10_000;
 const MAX_SLOTS: usize = 5; // TZ §2
 const MAX_PLAT_BPS: u16 = 5_000;
 const MAX_TIP: u64 = 50_000;
-const MAX_KINDS: u8 = 8; // 1 X, 2 Telegram, 3 GitHub, 4 Instagram; 5..8 reserved for the TZ update (YouTube, TikTok, Discord, Twitch)
+const MAX_KINDS: u8 = 8; // 1 X, 2 Telegram, 3 GitHub; 5..8 reserved for the TZ update (YouTube, TikTok, Discord, Twitch)
+const INSTAGRAM: u8 = 4; // removed (Valentin 29.10): refused whatever kind_max says
 const FEE_CAP: u64 = 50_000; // 5 %, LaunchLab rates are in 1e-6
 const LP_ALL: u64 = 1_000_000;
 const DAY: i64 = 86_400;
@@ -785,7 +786,7 @@ fn launch(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     for i in 0..n {
         let o = slot(i);
         let kind = r.u8()?;
-        need(kind <= cd[c::KIND_MAX], Error::BadParams)?;
+        need(kind <= cd[c::KIND_MAX] && kind != INSTAGRAM, Error::BadParams)?;
         let mut id = [0u8; 32];
         let len = if kind == WALLET { 32 } else { 8 };
         id[..len].copy_from_slice(r.take(len)?);
@@ -1181,7 +1182,7 @@ fn bind(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let kind = byte(d, 0)?;
     let id: [u8; 8] = rd(d, 1)?;
     let owner = key(d, 9)?;
-    need(kind != WALLET && kind <= cd[c::KIND_MAX] && id != [0; 8], Error::BadParams)?;
+    need(kind != WALLET && kind != INSTAGRAM && kind <= cd[c::KIND_MAX] && id != [0; 8], Error::BadParams)?;
     need(owner != ZERO && owner != ID && owner != SYSTEM && owner != *cfg.address() && owner != *acct.address(), Error::BadParams)?;
     let bump = [find(&[b"acct", &[kind], &id], acct)?];
     if acct.owned_by(&ID) {
