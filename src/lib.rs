@@ -2,10 +2,10 @@
 //! and pool creator are the program's per-coin inbox PDA ["inbox", mint], the fee rate is the one the coin's creator
 //! chose. `distribute` (anyone; our server every 2 min) claims the coin's LaunchLab platform fee and, after migration,
 //! its CPMM creator fee into the inbox, unwraps the SOL and splits it: the platform share to the config, the rest to
-//! up to 5 recipients (wallets, or X / Telegram / GitHub / Instagram accounts by numeric id). Wallets and bound
+//! up to 5 recipients (wallets, or X / Telegram / GitHub accounts by id). Wallets and bound
 //! accounts are paid at once, the rest waits as the slot's due. An account ["acct", kind, id] is bound to a wallet
-//! once by our server key after a social sign-in (bounded: a daily cap on everything it can direct). Dues unpaid for
-//! the period (14 days) go to the coin's holders. See README.md.
+//! once by our server key after a social sign-in (bounded: a daily cap on what it directs). Dues unpaid for
+//! the period (14 days) go to the sink wallet (bought back and burned). See README.md.
 #![cfg_attr(not(test), no_std)]
 
 use pinocchio::cpi::{invoke_signed_with_bounds, Seed, Signer};
@@ -30,9 +30,6 @@ const CPMM: Address = Address::from_str_const("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdT
 const TOKEN: Address = Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ATA: Address = Address::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const WSOL: Address = Address::from_str_const("So11111111111111111111111111111111111111112");
-// pool vault owners: their token accounts are never "holders"
-const LL_AUTH: Address = Address::from_str_const("WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh");
-const CPMM_AUTH: Address = Address::from_str_const("GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL");
 const ZERO: Address = Address::new_from_array([0; 32]);
 // Runtime-reserved ids that are never writable yet are neither executable nor sysvar-owned.
 const RESERVED: [Address; 5] = [
@@ -45,7 +42,6 @@ const RESERVED: [Address; 5] = [
 
 const BPS: u64 = 10_000;
 const MAX_SLOTS: usize = 5; // TZ §2
-const MAX_HOLDERS: usize = 10; // per sweep call
 const MAX_PLAT_BPS: u16 = 5_000;
 const MAX_TIP: u64 = 50_000;
 const MAX_KINDS: u8 = 8; // 1 X, 2 Telegram, 3 GitHub, 4 Instagram; 5..8 reserved for the TZ update (YouTube, TikTok, Discord, Twitch)
@@ -58,11 +54,11 @@ const PLATFORM_LEN: usize = 944; // LaunchLab PlatformConfig account
 const TOKEN_LEN: usize = 165;
 // defaults set by init_config, changed by set_config
 const PLAT_BPS: u16 = 1_000; // 10 % of every coin's fee stream (team approval pending)
-const BUYBACK_BPS: u16 = 5_000; // of the platform money: $PRISM buyback and burn (TZ)
-const TEAM_BPS: u16 = 2_000; // team (TZ); the rest goes to the holders wallet
-const PERIOD: i64 = 14 * DAY; // TZ: dues not taken for 14 days go to the coin's holders
+const BUYBACK_BPS: u16 = 4_000; // of the platform money: $PRISM buyback and burn (Valentin 29.10)
+const TEAM_BPS: u16 = 2_000; // team; the rest (40 %) goes to the $PRISM holders wallet
+const PERIOD: i64 = 14 * DAY; // dues not taken for 14 days go to the sink wallet (buyback and burn)
 const MIN_PERIOD: i64 = 60;
-const KIND_MAX: u8 = 4;
+const KIND_MAX: u8 = 3; // X, Telegram, GitHub (Instagram off, Valentin 29.10)
 const CAP: u64 = 5_000_000_000; // what our server key can direct a day: 5 SOL
 const TIP: u64 = 10_000; // to whoever pays the fee of a distribute / sponsored claim
 const MIN_FEE: u64 = 2_500; // 0.25 %
@@ -88,7 +84,7 @@ mod c {
     pub const BUYBACK_BPS: usize = 228; // u16
     pub const TEAM_BPS: usize = 230; // u16
     pub const PAUSED: usize = 232;
-    pub const SWEEP: usize = 233; // u8, 1 = dues unpaid for PERIOD go to holders
+    pub const SWEEP: usize = 233; // u8, 1 = dues unpaid for PERIOD go to SINK (`expire`)
     pub const KIND_MAX: usize = 234; // u8, highest account kind a launch may name
     pub const CAP: usize = 235; // u64
     pub const DAY: usize = 243; // i64
@@ -101,7 +97,8 @@ mod c {
     pub const LP_SCALE: usize = 295; // u64, LP share (1e6) to the team as a fee key NFT at migration; the rest is burned
     pub const PLAT_DUE: usize = 303; // u64, platform money held in this account
     pub const COINS: usize = 311; // u32, coin records not yet refunded (bindings close only after them)
-    pub const LEN: usize = 315;
+    pub const SINK: usize = 315; // where expired dues go (default the buyback wallet: bought back and burned)
+    pub const LEN: usize = 347;
 }
 mod k {
     pub const BUMP: usize = 1;
@@ -272,9 +269,6 @@ fn inbox(a: &AccountView, kd: &[u8]) -> ProgramResult {
     need(a.owned_by(&SYSTEM) && a.data_len() == 0, Error::BadAccount)?;
     check_pda(a, &[b"inbox", &kd[k::MINT..k::MINT + 32], &[kd[k::IBUMP]]])
 }
-fn inbox_address(kd: &[u8]) -> Result<Address, ProgramError> {
-    Address::create_program_address(&[b"inbox", &kd[k::MINT..k::MINT + 32], &[kd[k::IBUMP]]], &ID).map_err(|_| err(Error::BadAccount))
-}
 fn save(a: &mut AccountView, d: &[u8]) -> ProgramResult {
     writable(a)?;
     let mut data = a.try_borrow_mut()?;
@@ -340,7 +334,7 @@ fn takes(to: &AccountView, amount: u64) -> Result<bool, ProgramError> {
 fn payee_ok(x: &Address, cfg: &Address, coin_acc: &Address, inb: &Address) -> bool {
     *x != ZERO && x != &ID && *x != SYSTEM && x != cfg && x != coin_acc && x != inb
 }
-/// Dues of a slot unpaid for the period belong to the coin's holders (`sweep`).
+/// Dues of a slot unpaid for the period belong to the sink (`expire`).
 fn overdue(cd: &[u8], kd: &[u8], o: usize, now: i64) -> Result<bool, ProgramError> {
     Ok(cd[c::SWEEP] == 1 && now.saturating_sub(i64_at(kd, o + s::SINCE)?) >= i64_at(cd, c::PERIOD)?)
 }
@@ -432,7 +426,7 @@ pub fn process_instruction(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Pr
         6 => bind(a, args),
         7 => claim(a, args),
         8 => claim_platform(a),
-        9 => sweep(a, args),
+        9 => expire(a, args),
         10 => retire(a, args),
         11 => refund_coin(a),
         12 => close_ticker(a),
@@ -444,22 +438,25 @@ pub fn process_instruction(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Pr
 
 /// Roles may not be this program, its config, the system program or zero; payout wallets must be creditable and not
 /// our state; the CPMM config must be one. The admin signs to accept.
-fn roles(admin: &AccountView, binder: &AccountView, wallets: [&AccountView; 3], cp: &AccountView, cfg: &Address) -> ProgramResult {
+/// Wallets: buyback, team, holders, sink.
+fn roles(admin: &AccountView, binder: &AccountView, wallets: [&AccountView; 4], cp: &AccountView, cfg: &Address) -> ProgramResult {
     signer(admin)?;
-    for x in [admin.address(), binder.address(), wallets[0].address(), wallets[1].address(), wallets[2].address()] {
-        need(*x != ZERO && x != &ID && x != cfg && *x != SYSTEM, Error::BadParams)?;
-    }
+    need(*admin.address() != ZERO && admin.address() != &ID && admin.address() != cfg && *admin.address() != SYSTEM, Error::BadParams)?;
+    need(*binder.address() != ZERO && binder.address() != &ID && binder.address() != cfg && *binder.address() != SYSTEM, Error::BadParams)?;
     for w in wallets {
-        need(!w.executable() && !w.owned_by(&SYSVAR) && !w.owned_by(&ID) && !RESERVED.contains(w.address()), Error::BadParams)?;
+        let x = w.address();
+        need(*x != ZERO && x != &ID && x != cfg && *x != SYSTEM, Error::BadParams)?;
+        need(!w.executable() && !w.owned_by(&SYSVAR) && !w.owned_by(&ID) && !RESERVED.contains(x), Error::BadParams)?;
     }
     need(cp.owned_by(&CPMM), Error::BadParams)
 }
-fn set_roles(cd: &mut [u8], admin: &AccountView, binder: &AccountView, w: [&AccountView; 3], cp: &AccountView) -> ProgramResult {
+fn set_roles(cd: &mut [u8], admin: &AccountView, binder: &AccountView, w: [&AccountView; 4], cp: &AccountView) -> ProgramResult {
     put(cd, c::ADMIN, admin.address().as_ref())?;
     put(cd, c::BINDER, binder.address().as_ref())?;
     put(cd, c::BUYBACK, w[0].address().as_ref())?;
     put(cd, c::TEAM, w[1].address().as_ref())?;
     put(cd, c::HOLDERS, w[2].address().as_ref())?;
+    put(cd, c::SINK, w[3].address().as_ref())?;
     put(cd, c::CP_CONFIG, cp.address().as_ref())
 }
 
@@ -484,12 +481,12 @@ fn init_config(a: &mut [AccountView]) -> ProgramResult {
         )?;
     }
     let bump = [find(&[b"config"], cfg)?];
-    roles(admin, binder, [buyback, team, holders], cp, cfg.address())?;
+    roles(admin, binder, [buyback, team, holders, buyback], cp, cfg.address())?;
     init_account(authority, cfg, c::LEN, &[Seed::from(b"config"), Seed::from(&bump)])?;
     let mut cd = [0u8; c::LEN];
     cd[0] = CONFIG;
     cd[c::BUMP] = bump[0];
-    set_roles(&mut cd, admin, binder, [buyback, team, holders], cp)?;
+    set_roles(&mut cd, admin, binder, [buyback, team, holders, buyback], cp)?; // sink = buyback until set_config names one
     put(&mut cd, c::PLAT_BPS, &PLAT_BPS.to_le_bytes())?;
     put(&mut cd, c::BUYBACK_BPS, &BUYBACK_BPS.to_le_bytes())?;
     put(&mut cd, c::TEAM_BPS, &TEAM_BPS.to_le_bytes())?;
@@ -504,11 +501,11 @@ fn init_config(a: &mut [AccountView]) -> ProgramResult {
     save(cfg, &cd)
 }
 
-/// [admin(S), config(W), new_admin(S) (may be the same key), binder, buyback, team, holders, cp_config];
+/// [admin(S), config(W), new_admin(S) (may be the same key), binder, buyback, team, holders, cp_config, sink];
 /// args: plat_bps u16 (<= 5000), buyback_bps u16, team_bps u16 (sum <= 10 000), paused u8, sweep u8, kind_max u8
 /// (1..=8), cap u64, tip u64 (<= 50 000), period i64 (>= 60 s), min_fee u64, max_fee u64 (<= 5 %), lp_scale u64 (<= 1e6).
 fn set_config(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    let [admin, cfg, new_admin, binder, buyback, team, holders, cp, ..] = a else {
+    let [admin, cfg, new_admin, binder, buyback, team, holders, cp, sink, ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let mut cd = config(cfg)?;
@@ -539,14 +536,15 @@ fn set_config(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         && *buyback.address() == key(&cd, c::BUYBACK)?
         && *team.address() == key(&cd, c::TEAM)?
         && *holders.address() == key(&cd, c::HOLDERS)?
-        && *cp.address() == key(&cd, c::CP_CONFIG)?;
+        && *cp.address() == key(&cd, c::CP_CONFIG)?
+        && *sink.address() == key(&cd, c::SINK)?;
     if same {
         // unchanged roles are not re-validated, so a pause (the first wind-down step) never stalls on them
         signer(new_admin)?;
     } else {
-        roles(new_admin, binder, [buyback, team, holders], cp, cfg.address())?;
+        roles(new_admin, binder, [buyback, team, holders, sink], cp, cfg.address())?;
     }
-    set_roles(&mut cd, new_admin, binder, [buyback, team, holders], cp)?;
+    set_roles(&mut cd, new_admin, binder, [buyback, team, holders, sink], cp)?;
     put(&mut cd, c::PLAT_BPS, &plat_bps.to_le_bytes())?;
     put(&mut cd, c::BUYBACK_BPS, &buyback_bps.to_le_bytes())?;
     put(&mut cd, c::TEAM_BPS, &team_bps.to_le_bytes())?;
@@ -995,7 +993,7 @@ fn claim(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     }
     need(key(&kd, o + s::OWNER)? == *owner.address(), Error::Unauthorized)?;
     let now = now()?;
-    need(!overdue(&cd, &kd, o, now)?, Error::Expired)?; // it is the holders': `sweep`
+    need(!overdue(&cd, &kd, o, now)?, Error::Expired)?; // it is the sink.s: `expire`
     let due = u64_at(&kd, o + s::DUE)?;
     let mut amount = due;
     if kd[o + s::FLAGS] & BOUND != 0 {
@@ -1042,72 +1040,28 @@ fn claim_platform(a: &mut [AccountView]) -> ProgramResult {
     save(cfg, &cd)
 }
 
-/// [signer(S) (binder, or the admin), config(W), coin(W), then up to 10 pairs (holder token account, its owner(W))];
-/// args: slot u8. A slot whose due went unpaid for the period (or any slot while paused: wind-down) pays that due to the
-/// listed holders of the coin pro rata to their balances. Our server picks the top holders; the program checks each is a
-/// real token account of this mint with a balance and pays its owner. Pool vaults and our own state are never holders.
-/// The binder's sweeps count toward the daily cap.
-fn sweep(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    let [who, cfg, coin_acc, pairs @ ..] = a else {
+/// Permissionless (our keeper). [config, coin(W), sink(W)]; args: slot u8. A slot whose due went unpaid for the period
+/// pays the whole due to the config's sink wallet (the team buys back and burns with it; no tip: all of it is burned).
+/// The unpaid clock restarts.
+fn expire(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    let [cfg, coin_acc, sink, ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    let mut cd = config(cfg)?;
-    signer(who)?;
-    let is_admin = who.address() == &key(&cd, c::ADMIN)?;
-    need(is_admin || who.address() == &key(&cd, c::BINDER)?, Error::Unauthorized)?;
-    need(cd[c::SWEEP] == 1, Error::NotExpired)?;
+    let cd = config(cfg)?;
+    is(sink, &key(&cd, c::SINK)?)?;
     let mut kd = coin(coin_acc)?;
     let i = byte(d, 0)? as usize;
     need(i < kd[k::N] as usize, Error::BadParams)?;
     let o = slot(i);
     let now = now()?;
-    need(cd[c::PAUSED] == 1 || overdue(&cd, &kd, o, now)?, Error::NotExpired)?;
+    need(overdue(&cd, &kd, o, now)?, Error::NotExpired)?;
     let due = u64_at(&kd, o + s::DUE)?;
     need(due > 0, Error::NothingToClaim)?;
-    let m = pairs.len() / 2;
-    need(m >= 1 && m <= MAX_HOLDERS && pairs.len() == m * 2, Error::BadAccount)?;
-    let inb = inbox_address(&kd)?;
-    let mut bal = [0u64; MAX_HOLDERS];
-    let mut total = 0u128;
-    for j in 0..m {
-        let (ta, w) = (&pairs[2 * j], &pairs[2 * j + 1]);
-        need(ta.owned_by(&TOKEN) && ta.data_len() == TOKEN_LEN, Error::BadAccount)?;
-        for p in 0..j {
-            need(pairs[2 * p].address() != ta.address(), Error::BadAccount)?;
-        }
-        let td = ta.try_borrow()?;
-        need(td[0..32] == kd[k::MINT..k::MINT + 32] && &td[32..64] == w.address().as_ref(), Error::BadAccount)?;
-        let x = w.address();
-        need(x != &LL_AUTH && x != &CPMM_AUTH && payee_ok(x, cfg.address(), coin_acc.address(), &inb), Error::BadAccount)?;
-        bal[j] = u64_at(&td, 64)?;
-        total += bal[j] as u128;
-    }
-    need(total > 0, Error::BadAccount)?;
-    // the binder pays out within today's cap; a capped sweep leaves the rest overdue for the next one
-    let budget = if is_admin { due } else { due.min(cap_left(&mut cd, now)?) };
-    need(budget > 0, Error::CapReached)?;
-    let (mut paid, mut refused) = (0u64, false);
-    for j in 0..m {
-        let amt = ((budget as u128 * bal[j] as u128) / total) as u64;
-        let w = &mut pairs[2 * j + 1];
-        if amt > 0 && takes(w, amt)? {
-            pay(coin_acc, w, amt)?;
-            paid += amt;
-        } else if amt > 0 {
-            refused = true;
-        }
-    }
-    need(paid > 0, Error::PayoutBelowRent)?;
-    if !is_admin {
-        inc(&mut cd, c::USED, paid)?;
-    }
-    put(&mut kd, o + s::DUE, &(due - paid).to_le_bytes())?;
-    // the whole due shared out (only rounding dust left): the clock restarts; a capped or refused part stays overdue
-    if budget == due && !refused {
-        put(&mut kd, o + s::SINCE, &now.to_le_bytes())?;
-    }
-    save(coin_acc, &kd)?;
-    save(cfg, &cd)
+    need(takes(sink, due)?, Error::PayoutBelowRent)?;
+    pay(coin_acc, sink, due)?;
+    put(&mut kd, o + s::DUE, &0u64.to_le_bytes())?;
+    put(&mut kd, o + s::SINCE, &now.to_le_bytes())?;
+    save(coin_acc, &kd)
 }
 
 /// Wind-down, while paused. [admin(S), config, coin, inbox, launchlab, platform(W)]; args: what u8. The inbox, the
@@ -1141,18 +1095,22 @@ fn retire(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
 }
 
 /// Wind-down, while paused, right after a `distribute` in the same tx. [admin(S), config(W), coin(W), inbox(W),
-/// author(W), system, then two accounts per slot in slot order: (payee, binding)]. The payee is the slot's owner; for an
-/// account slot no claim has copied a binding into yet, the wallet its ["acct", kind, id] binding names when that
-/// binding (passed next) exists, else the author. Books what is left on the inbox, pays every due (one that cannot take
-/// it -> author, then the platform money); the inbox reserve and the coin rent go back to the author; the coin closes.
+/// author(W), system, sink(W), then two accounts per slot in slot order: (payee, binding)]. The payee is the slot's
+/// owner; for an account slot no claim has copied a binding into yet, the wallet its ["acct", kind, id] binding names
+/// when that binding (passed next) exists, else the author. Books what is left on the inbox, pays every due (overdue ->
+/// sink; one that cannot take it -> author, then the platform money); the inbox reserve and the coin rent go back to the
+/// author; the coin closes.
 fn refund_coin(a: &mut [AccountView]) -> ProgramResult {
-    let [admin, cfg, coin_acc, inb, author, sys, owners @ ..] = a else {
+    let [admin, cfg, coin_acc, inb, author, sys, sink, owners @ ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let mut cd = config(cfg)?;
     admin_of(admin, &cd)?;
     need(cd[c::PAUSED] == 1, Error::NotPaused)?;
     is(sys, &SYSTEM)?;
+    is(sink, &key(&cd, c::SINK)?)?;
+    writable(sink)?; // a read-only sink would let overdue dues fall through to the author
+    let now = now()?;
     let mut kd = coin(coin_acc)?;
     inbox(inb, &kd)?;
     is(author, &key(&kd, k::AUTHOR)?)?;
@@ -1160,7 +1118,7 @@ fn refund_coin(a: &mut [AccountView]) -> ProgramResult {
     let n = kd[k::N] as usize;
     need(owners.len() >= 2 * n, Error::BadAccount)?;
     let amount = pull(inb, coin_acc, &kd)?;
-    let plat = split(&mut kd, amount, now()?)?;
+    let plat = split(&mut kd, amount, now)?;
     pay(coin_acc, cfg, plat)?;
     inc(&mut cd, c::PLAT_DUE, plat)?;
     let left = inb.lamports();
@@ -1185,7 +1143,9 @@ fn refund_coin(a: &mut [AccountView]) -> ProgramResult {
         is(dest, if owner == ZERO { author.address() } else { &owner })?;
         // a plain wallet must come writable: only addresses the runtime never lets write may be read-only
         need(dest.is_writable() || dest.executable() || dest.owned_by(&SYSVAR) || RESERVED.contains(dest.address()), Error::BadAccount)?;
-        if dest.address() != author.address() && payee_ok(dest.address(), cfg.address(), coin_acc.address(), inb.address()) && takes(dest, due)? {
+        if overdue(&cd, &kd, o, now)? && takes(sink, due)? {
+            pay(coin_acc, sink, due)?; // unpaid past the period: the sink's, as in `expire`
+        } else if dest.address() != author.address() && payee_ok(dest.address(), cfg.address(), coin_acc.address(), inb.address()) && takes(dest, due)? {
             pay(coin_acc, dest, due)?;
         } else if takes(author, due)? {
             pay(coin_acc, author, due)?;
